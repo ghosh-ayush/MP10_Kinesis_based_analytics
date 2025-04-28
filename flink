@@ -1,0 +1,204 @@
+%flink.ssql
+USE CATALOG default_catalog;
+
+%flink.ssql
+USE default_database;
+
+%flink.ssql
+DROP TABLE IF EXISTS stock_table;
+
+%flink.ssql
+CREATE TABLE stock_table (
+  `date`        STRING,
+  `ticker`      VARCHAR(6),
+  `open`        FLOAT,
+  `high`        FLOAT,
+  `low`         FLOAT,
+  `close_price` FLOAT,
+  `adj_close`   FLOAT,
+  `volume`      BIGINT,
+  `event_time`  TIMESTAMP(3) METADATA FROM 'timestamp',
+    WATERMARK FOR event_time as event_time
+) WITH (
+  'connector'                        = 'kinesis',
+  'stream'                           = 'mp10_kinesis_data_stream',
+  'aws.region'                       = 'us-east-1',
+  'scan.stream.initpos'              = 'TRIM_HORIZON',
+  'format'                           = 'json',
+  'json.timestamp-format.standard'  = 'ISO-8601'
+);
+
+%flink.ssql
+DROP TABLE IF EXISTS part_a;
+
+%flink.ssql
+CREATE TABLE part_a (
+  event_time    TIMESTAMP(3),
+  cmgr          FLOAT,
+  `date`        STRING,
+  close_price   FLOAT
+) WITH (
+  'connector'                         = 'filesystem',
+  'path'                              = 's3://mp10-s3/output/part_a',
+  'format'                            = 'json',
+  'json.timestamp-format.standard'    = 'ISO-8601'
+);
+
+%flink.ssql
+DROP TABLE IF EXISTS part_b;
+
+%flink.ssql
+CREATE TABLE part_b (
+  ticker           VARCHAR(6),
+  `date`           STRING,
+  close_price      FLOAT,
+  avg_close_price  FLOAT,
+  ema_close_price  DOUBLE
+) WITH (
+  'connector' = 'filesystem',
+  'path'      = 's3://mp10-s3/output/part_b',
+  'format'    = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601'
+);
+
+%flink.ssql
+DROP TABLE IF EXISTS part_c;
+
+%flink.ssql
+CREATE TABLE part_c (
+  ticker           VARCHAR(6),
+  event_time       TIMESTAMP(3),
+  initialPriceDate STRING,
+  dropDate         STRING,
+  dropPercentage   FLOAT,
+  initialPrice     FLOAT,
+  lastPrice        FLOAT
+) WITH (
+  'connector' = 'filesystem',
+  'path'      = 's3://mp10-s3/output/part_c',
+  'format'    = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601'
+);
+
+%flink.ssql(type=update)
+DROP TEMPORARY FUNCTION IF EXISTS cmgr;
+
+%flink.pyflink
+import datetime
+from pyflink.table import DataTypes, StreamTableEnvironment
+from pyflink.table.udf import udf
+from pyflink.datastream import StreamExecutionEnvironment
+
+START_PRICE = 92.30
+START_YEAR  = 2021
+START_MONTH = 1
+
+def months_between(sy, sm, y, m):
+    return (y - sy) * 12 + (m - sm)
+
+@udf(result_type=DataTypes.DOUBLE(),input_types=[DataTypes.STRING(), DataTypes.DOUBLE()])
+def cmgr(date: str, close_price: float) -> float:
+    dt = datetime.datetime.strptime(date, "%m/%d/%Y")
+    if (dt.year == START_YEAR and dt.month == START_MONTH) or dt.day > 3:
+        return 0.0
+    num_months = months_between(START_YEAR, START_MONTH, dt.year, dt.month)
+    if num_months <= 0:
+        return 0.0
+    return ((close_price / START_PRICE) ** (1.0 / num_months) - 1.0) * 100.0
+
+# Refresh registration
+try:
+    st_env.drop_temporary_function("cmgr")
+except:
+    pass
+
+st_env.create_temporary_function("cmgr", cmgr)
+
+print("✅ UDF 'cmgr' registered")
+
+%flink.pyflink
+print("TEST:", cmgr("2021-01-04", 100.0))
+
+
+%flink.pyflink
+# --- keep your StatementSet initialisation as-is ---
+stmt_set: StatementSet = st_env.create_statement_set()
+
+# -------------------- part A – unchanged --------------------
+stmt_set.add_insert_sql("""
+  INSERT INTO part_a
+  SELECT
+     CAST(event_time AS TIMESTAMP(3))                       AS event_time,   -- TZ-less
+    CAST(cmgr(`date`, close_price) AS FLOAT)     AS cmgr,  
+      `date`,
+      close_price
+     
+  FROM stock_table
+  WHERE cmgr(`date`, close_price) <> 0.0
+""")
+
+# -------------------- part B – **fixed** --------------------
+stmt_set.add_insert_sql("""
+INSERT INTO part_b
+WITH calc AS (
+  SELECT
+    ticker,
+    `date`,
+    close_price,
+    AVG(close_price) OVER (
+      PARTITION BY ticker
+      ORDER BY event_time
+      ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+    ) AS avg_close_price,
+    EXP(
+      SUM(LN(close_price)) OVER (
+        PARTITION BY ticker
+        ORDER BY event_time
+        ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+      ) / 10
+    ) AS ema_close_price
+  FROM stock_table
+)
+SELECT
+  ticker,
+  `date`,
+  close_price,
+  avg_close_price,
+  ema_close_price
+FROM calc
+WHERE close_price < ema_close_price
+""")
+
+# -------------------- part C – unchanged --------------------
+stmt_set.add_insert_sql("""
+INSERT INTO part_c
+SELECT
+  ticker,
+  event_time,
+  initialPriceDate,
+  dropDate,
+  dropPercentage,
+  initialPrice,
+  lastPrice
+FROM stock_table
+MATCH_RECOGNIZE (
+  ORDER BY event_time
+  MEASURES
+    A.ticker                                                       AS ticker,
+    A.event_time                                                   AS event_time,
+    A.`date`                                                       AS initialPriceDate,
+    C.`date`                                                       AS dropDate,
+    (A.close_price - C.close_price) / A.close_price * 100          AS dropPercentage,
+    A.close_price                                                  AS initialPrice,
+    C.close_price                                                  AS lastPrice
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (A B{0,2} C)
+  DEFINE
+    B AS -100 * (B.close_price - A.close_price) / A.close_price < 8.0,
+    C AS -100 * (C.close_price - A.close_price) / A.close_price >= 8.0
+)
+""")
+
+# -------------------- execute everything --------------------
+stmt_set.execute()
